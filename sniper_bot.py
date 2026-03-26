@@ -3,11 +3,7 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- LOGGING ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- CREDENTIALS ---
+# --- CREDENTIALS (Double check these!) ---
 TELEGRAM_TOKEN = "8247420186:AAFH2UALqnWulQgQVgyQCaRoYsuaLggy5ko"
 GEMINI_KEY = "AIzaSyAzR1d31UpVbkoHMAdckTJw9gR5UOOPJ5s"
 NEWS_KEY = "f202eef0c1dc46dbad354b752a8b534b"
@@ -16,7 +12,6 @@ FREE_CRYPTO_KEY = "xepv32wtw9xgksv1bsga"
 genai.configure(api_key=GEMINI_KEY)
 ai_model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- DATABASE LOGIC ---
 def init_db():
     conn = sqlite3.connect('sniper.db')
     conn.execute('CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY)')
@@ -40,26 +35,29 @@ def price_has_changed(symbol, current_price):
     conn.close(); return False
 
 async def ai_gen(text, mode="news"):
-    prompt = f"Summarize this {mode} into 2 punchy English sentences with emojis. Focus on the core facts. DATA: {text}"
+    # STRICT INSTRUCTION TO GEMINI TO STAY IN ENGLISH
+    prompt = f"Summarize this into 2 short sentences in ENGLISH only. Use emojis. DATA: {text}"
     try:
         response = await ai_model.generate_content_async(prompt)
         return response.text
     except: return f"📍 **{mode.upper()} Update**\n{text[:100]}..."
 
 # --- ENGINES ---
-async def fb_engine(context: ContextTypes.DEFAULT_TYPE):
+async def fb_engine(context):
     from playwright.async_api import async_playwright
     job = context.job
     try:
-        geo = requests.get(f"https://nominatim.openstreetmap.org/search?q={job.data['city']}&format=json&limit=1", headers={'User-Agent':'Sniper'}).json()
+        geo = requests.get(f"https://nominatim.openstreetmap.org/search?q={job.data['city']}&format=json&limit=1", headers={'User-Agent':'SniperBot'}).json()
         lat, lon = geo[0]['lat'], geo[0]['lon']
         async with async_playwright() as p:
+            # Added User Agent to stop FB from blocking the bot
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            context_browser = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+            page = await context_browser.new_page()
             url = f"https://www.facebook.com/marketplace/search/?query={job.data['item']}&latitude={lat}&longitude={lon}&radius_in_km={job.data['radius']}"
-            await page.goto(url); await asyncio.sleep(10)
+            await page.goto(url, wait_until="networkidle"); await asyncio.sleep(8)
+            
             listings = await page.locator('div[style*="max-width:381px"]').all()
-            print(f"DEBUG: Found {len(listings)} FB items for {job.data['item']}")
             for item in listings[:3]:
                 raw = await item.inner_text()
                 link_el = await item.locator('a').first()
@@ -68,36 +66,32 @@ async def fb_engine(context: ContextTypes.DEFAULT_TYPE):
                     pretty = await ai_gen(raw, "Marketplace")
                     await context.bot.send_message(chat_id=job.chat_id, text=f"{pretty}\n🔗 {href}", parse_mode="Markdown")
             await browser.close()
-    except Exception as e: logger.error(f"FB Error: {e}")
+    except Exception as e: print(f"FB Error: {e}")
 
-async def crypto_engine(context: ContextTypes.DEFAULT_TYPE):
+async def crypto_engine(context):
     job = context.job
     headers = {"Authorization": f"Bearer {FREE_CRYPTO_KEY}"}
-    coins_to_check = job.data['coins']
-
-    # --- MAGIC "ALL" LOGIC ---
-    if coins_to_check.upper() == "ALL":
+    coins = job.data['coins']
+    if coins.upper() == "ALL":
         try:
             r_list = requests.get("https://api.freecryptoapi.com/v1/getCryptoList", headers=headers).json()
-            coins_to_check = ",".join([c['symbol'] for c in r_list[:50]]) # Top 50
-        except:
-            coins_to_check = "BTC,ETH,SOL,BNB,XRP,ADA,DOGE,TRX,TON,DOT"
+            coins = ",".join([c['symbol'] for c in r_list[:50]])
+        except: coins = "BTC,ETH,SOL,BNB,XRP"
 
-    for sym in coins_to_check.split(','):
+    for sym in coins.split(','):
         sym = sym.strip().upper()
         try:
             r = requests.get(f"https://api.freecryptoapi.com/v1/getData?symbol={sym}", headers=headers).json()
             data = r[0] if isinstance(r, list) else r
             p = data.get('price')
             if price_has_changed(sym, p):
-                msg = f"{sym} is ${p}. 24h Change: {data.get('change_24h')}%"
-                pretty = await ai_gen(msg, "crypto")
+                pretty = await ai_gen(f"{sym} is ${p}", "crypto")
                 await context.bot.send_message(chat_id=job.chat_id, text=pretty, parse_mode="Markdown")
         except: continue
 
-async def news_engine(context: ContextTypes.DEFAULT_TYPE):
+async def news_engine(context):
     job = context.job
-    # qInTitle ensures we don't get random "Salah" news if searching for "Qatar"
+    # FIXED: Added language=en and searchIn=title for precision
     url = f"https://newsapi.org/v2/everything?qInTitle={job.data['q']}&language=en&sortBy=publishedAt&apiKey={NEWS_KEY}"
     try:
         r = requests.get(url).json()
@@ -107,53 +101,37 @@ async def news_engine(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=job.chat_id, text=f"{summary}\n🔗 {art['url']}", parse_mode="Markdown")
     except: pass
 
-# --- COMMANDS ---
-def parse_time(t):
+# --- HANDLERS ---
+def p_time(t):
     m = re.search(r'(\d+)([hm])', str(t).lower())
     if not m: return 1
-    val, unit = int(m.group(1)), m.group(2)
-    return val * 60 if unit == 'h' else val
+    return int(m.group(1)) * 60 if m.group(2) == 'h' else int(m.group(1))
 
 async def fb_cmd(u, c):
-    if len(c.args) < 4:
-        await u.message.reply_text("❌ `/facebook \"Item Name\" City Radius Time`")
-        return
-    t = parse_time(c.args[-1])
+    if len(c.args) < 4: return
+    t = p_time(c.args[-1])
     c.job_queue.run_repeating(fb_engine, interval=t*60, first=1, data={'item':c.args[0],'city':c.args[1],'radius':c.args[2]}, chat_id=u.effective_chat.id, name=f"FB_{u.effective_chat.id}")
-    await u.message.reply_text(f"🎯 FB Sniper Active for {c.args[0]}!")
+    await u.message.reply_text(f"🎯 FB Sniper Active for {c.args[0]}")
 
 async def cry_cmd(u, c):
-    if len(c.args) < 2:
-        await u.message.reply_text("❌ `/crypto 1m BTC` or `/crypto 1m ALL`")
-        return
-    t_str = c.args[0]
-    t = parse_time(t_str)
-    job_name = f"CRYPTO_{u.effective_chat.id}"
-    # Stop existing crypto job if running
-    for j in c.job_queue.get_jobs_by_name(job_name): j.schedule_removal()
-    
-    c.job_queue.run_repeating(crypto_engine, interval=t*60, first=1, data={'coins':c.args[1]}, chat_id=u.effective_chat.id, name=job_name)
-    await u.message.reply_text(f"🚀 Crypto Sniper Active (Every {t_str})")
+    if len(c.args) < 2: return
+    t = p_time(c.args[0])
+    c.job_queue.run_repeating(crypto_engine, interval=t*60, first=1, data={'coins':c.args[1]}, chat_id=u.effective_chat.id, name=f"CRYPTO_{u.effective_chat.id}")
+    await u.message.reply_text("🚀 Crypto Sniper Active!")
 
 async def news_cmd(u, c):
     if len(c.args) < 2: return
-    t_str = c.args[0]
-    t = parse_time(t_str)
+    t = p_time(c.args[0])
     c.job_queue.run_repeating(news_engine, interval=t*60, first=1, data={'q':c.args[1]}, chat_id=u.effective_chat.id, name=f"NEWS_{u.effective_chat.id}")
-    await u.message.reply_text(f"📰 News Sniper Active for {c.args[1]} (Every {t_str})")
-
-async def status(u, c):
-    cid = str(u.effective_chat.id)
-    active = [j.name.split('_')[0] for j in c.job_queue.jobs() if cid in j.name]
-    msg = "🎯 **Active Snipers:**\n" + "\n".join([f"• {n}" for n in active])
-    await u.message.reply_text(msg if active else "📭 No active snipers.")
+    await u.message.reply_text(f"📰 News Sniper Active for {c.args[1]}")
 
 async def stop(u, c):
     cid = str(u.effective_chat.id)
     target = c.args[0].upper() if c.args else "ALL"
+    jobs = c.job_queue.jobs()
     removed = 0
-    for j in c.job_queue.jobs():
-        if cid in j.name and (target == "ALL" or target in j.name):
+    for j in jobs:
+        if cid in str(j.name) and (target == "ALL" or target in j.name):
             j.schedule_removal(); removed += 1
     await u.message.reply_text(f"🛑 Stopped {removed} sniper(s).")
 
@@ -163,7 +141,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("facebook", fb_cmd))
     app.add_handler(CommandHandler("crypto", cry_cmd))
     app.add_handler(CommandHandler("news", news_cmd))
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stop", stop))
-    print("ULTIMATE SNIPER v5 ONLINE. 🚀")
+    print("ULTIMATE SNIPER ONLINE. 🚀")
     app.run_polling()
