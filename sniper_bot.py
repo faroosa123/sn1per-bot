@@ -8,7 +8,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # --- CREDENTIALS ---
-TELEGRAM_TOKEN = "8632300395:AAFn17SlsVan4GqkEfXKZx0QqmzCwa7zMg8"
+TELEGRAM_TOKEN = "8247420186:AAFH2UALqnWulQgQVgyQCaRoYsuaLggy5ko"
 GEMINI_KEY = "AIzaSyAzR1d31UpVbkoHMAdckTJw9gR5UOOPJ5s"
 NEWS_KEY = "f202eef0c1dc46dbad354b752a8b534b"
 FREE_CRYPTO_KEY = "xepv32wtw9xgksv1bsga"
